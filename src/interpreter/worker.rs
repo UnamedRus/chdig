@@ -62,6 +62,8 @@ pub enum Event {
     ExplainPipelineOpenGraphInBrowser(String, String),
     // (database, query)
     ExplainPlanIndexes(String, String),
+    // (initial_query_id, proto_path, output_path)
+    GeneratePerfettoTrace(String, String, String),
     // TODO: support different types somehow
     // (view_name, query)
     ViewQuery(&'static str, String),
@@ -458,6 +460,20 @@ async fn process_event(context: ContextArc, event: Event, need_clear: &mut bool)
                             return anyhow::Ok(());
                         })
                         .unwrap();
+                }))
+                .map_err(|_| anyhow!("Cannot send message to UI"))?;
+        }
+        Event::GeneratePerfettoTrace(initial_id, proto, output) => {
+            let ret = clickhouse
+                .generate_perfetto_trace_pb(&initial_id, &proto, &output)
+                .await;
+            let message = match ret {
+                Ok(_) => format!("Perfetto trace saved to {}", output),
+                Err(err) => err.to_string(),
+            };
+            cb_sink
+                .send(Box::new(move |siv: &mut cursive::Cursive| {
+                    siv.add_layer(views::Dialog::info(message));
                 }))
                 .map_err(|_| anyhow!("Cannot send message to UI"))?;
         }
