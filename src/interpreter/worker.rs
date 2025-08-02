@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::fs;
+use std::fs;
 
 #[derive(Debug, Clone)]
 pub enum Event {
