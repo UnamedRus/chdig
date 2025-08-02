@@ -1019,47 +1019,27 @@ impl ProcessesView {
         });
         context.add_view_action(&mut event_view, "Generate perfetto trace", 'T', |v| {
             let v = v.downcast_mut::<ProcessesView>().unwrap();
-            let initial_query_id = v.get_selected_query()?.initial_query_id.clone();
-            let context_copy = v.context.clone();
-            v.context
-                .lock()
-                .unwrap()
-                .cb_sink
-                .send(Box::new(move |siv: &mut cursive::Cursive| {
-                    let ctx = context_copy.clone();
-                    let init_id = initial_query_id.clone();
-                    let submit = move |siv: &mut Cursive| {
-                        let proto = siv
-                            .call_on_name("perf_proto", |view: &mut EditView| view.get_content())
-                            .unwrap();
-                        let output = siv
-                            .call_on_name("perf_output", |view: &mut EditView| view.get_content())
-                            .unwrap();
-                        siv.pop_layer();
-                        ctx.lock().unwrap().worker.send(
-                            true,
-                            WorkerEvent::GeneratePerfettoTrace(
-                                init_id.clone(),
-                                proto.to_string(),
-                                output.to_string(),
-                            ),
-                        );
-                    };
-                    siv.add_layer(
-                        views::Dialog::new()
-                            .title("Generate perfetto trace")
-                            .content(
-                                views::LinearLayout::vertical()
-                                    .child(views::TextView::new("perfetto_trace.proto:"))
-                                    .child(EditView::new().with_name("perf_proto"))
-                                    .child(views::DummyView.fixed_height(1))
-                                    .child(views::TextView::new("output file:"))
-                                    .child(EditView::new().with_name("perf_output")),
-                            )
-                            .button("Submit", submit),
-                    );
-                }))
-                .unwrap();
+            let selected_query = v.get_selected_query()?;
+            let database = selected_query.current_database.clone();
+            let query = selected_query.original_query.clone();
+            let query_id = selected_query.initial_query_id.clone();
+            v.context.lock().unwrap().worker.send(
+                true,
+                WorkerEvent::GeneratePerfettoTrace(database, query, query_id),
+            );
+
+            return Ok(Some(EventResult::consumed()));
+        });
+        context.add_view_action(&mut event_view, "View perfetto trace in browser", 'B', |v| {
+            let v = v.downcast_mut::<ProcessesView>().unwrap();
+            let selected_query = v.get_selected_query()?;
+            let database = selected_query.current_database.clone();
+            let query = selected_query.original_query.clone();
+            let query_id = selected_query.initial_query_id.clone();
+            v.context.lock().unwrap().worker.send(
+                true,
+                WorkerEvent::OpenPerfettoTrace(database, query, query_id),
+            );
 
             return Ok(Some(EventResult::consumed()));
         });

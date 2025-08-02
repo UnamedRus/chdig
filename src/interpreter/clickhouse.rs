@@ -11,175 +11,7 @@ use clickhouse_rs::{
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::str::FromStr;
-use tempfile::NamedTempFile;
 
-const QUERY_TRACK_QUERY: &str = r#"WITH
-    [{ids}] AS my_query_id,
-    murmurHash3_32(query_id) AS uuid,
-    murmurHash3_32(hostname) as machine_id,
-    if(is_initial_query, 'Init', '') as init,
-    format('{} Query: {}', init, query_id) AS name,
-    murmurHash3_32(query_id) % 4194304 AS pid
-SELECT format('packet {{
-  machine_id: {{}}
-  timestamp: 0
-  sequence_flags: 1
-  trusted_packet_sequence_id: {{}}
-  track_descriptor {{
-    uuid: {{}}
-    name: "{}"
-  process: {{
-  pid: {{}}
-   process_name: "{}"
-   }}
-}}
-}}', machine_id, uuid, uuid, name, pid, name)
-FROM clusterAllReplicas('{cluster}', system.query_log)
-WHERE (query_id IN my_query_id)
-GROUP BY machine_id, query_id, is_initial_query
-FORMAT TSVRaw"#;
-
-const QUERY_TRACK_THREAD: &str = r#"WITH
-    [{ids}] AS my_query_id,
-    murmurHash3_32(query_id) AS parent_uuid,
-    murmurHash3_32(tid, query_id) AS uuid,
-    murmurHash3_32(hostname) as machine_id,
-    format('Query: {}, Thread: {}', query_id, tid) AS name,
-    murmurHash3_32(query_id) % 4194304 AS pid,
-    arrayJoin(thread_ids) AS tid
-SELECT format('packet {{
-  machine_id: {{}}
-  timestamp: 0
-  sequence_flags: 1
-  trusted_packet_sequence_id: {{}}
-  track_descriptor {{
-    name: "{}"
-    parent_uuid: {{}}
-    uuid: {{}}
-    thread {{
-      pid: {{}}
-      tid: {{}}
-      thread_name: "{}"
-      }}
-  }}
-}}', machine_id, uuid, name, parent_uuid, uuid, pid, tid, tid)
-FROM clusterAllReplicas('{cluster}', system.query_log)
-WHERE (query_id IN my_query_id)
-GROUP BY tid, machine_id, query_id
-FORMAT TSVRaw"#;
-
-const QUERY_TRACK_COUNTER: &str = r#"WITH
-    [{ids}] AS my_query_id,
-    murmurHash3_32(hostname) as machine_id,
-    murmurHash3_32(thread_id, query_id) AS parent_uuid,
-    arrayStringConcat(arrayMap(cat -> format('    categories: "{}"\n', cat), extractAll(event, 'Lock|Microseconds|Bytes|Network|IO|Read|Write|Wait|OS|Log|ThreadPool|ConcurrencyControl|Arena|Page|Fault|Selected|Execute')), '\n') AS categories,
-    bitShiftLeft(CAST(parent_uuid, 'UInt64'), 32) + murmurHash3_32(event) AS uuid,
-    multiIf(event LIKE '%seconds%', 'UNIT_TIME_NS', event LIKE '%Bytes%', 'UNIT_SIZE_BYTES', 'UNIT_COUNT') AS unit,
-    if(event LIKE '%Microseconds%', '    unit_multiplier: 1000\n' ,'') AS unit_multiplier,
-    event AS name,
-    true AS is_incremental
-SELECT format('packet {{\n  machine_id: {{}}\n  trusted_packet_sequence_id: 3903809\n  timestamp: 0\n  track_descriptor {{\n    uuid: {{}}\n    parent_uuid: {{}}\n    name: "{}"\n    counter {{{{}}\n  {{}}\n      unit: {{}}\n      is_incremental: {{}}\n    }}\n  }}\n}}', machine_id, uuid, parent_uuid, name, unit_multiplier, categories,unit,is_incremental)
-FROM clusterAllReplicas('{cluster}', system.trace_log)
-WHERE (query_id IN my_query_id) AND (trace_type = 'ProfileEvent')
-GROUP BY
-    thread_id,
-    query_id,
-    event,
-    machine_id
-FORMAT TSVRaw"#;
-
-const QUERY_TRACK_COUNTER_EVENT: &str = r#"WITH
-    [{ids}] AS my_query_id,
-    murmurHash3_32(hostname) as machine_id,
-    murmurHash3_32(thread_id, query_id) AS parent_uuid,
-    bitShiftLeft(CAST(parent_uuid, 'UInt64'), 32) + murmurHash3_32(event) AS track_uuid,
-    'TYPE_COUNTER' AS type,
-    increment AS counter_value
-SELECT format('packet {{\n  machine_id: {{}}\n  timestamp: {{}}\n  track_event {{\n    type: {{}}\n    track_uuid: {{}}\n    counter_value: {{}}\n  }}\n  trusted_packet_sequence_id: 3903809\n}}', machine_id, timestamp_ns, type, track_uuid, counter_value)
-FROM clusterAllReplicas('{cluster}', system.trace_log)
-WHERE (query_id IN my_query_id) AND (trace_type = 'ProfileEvent') AND (increment != 0)
-ORDER BY timestamp_ns ASC
-FORMAT TSVRaw"#;
-
-const QUERY_PROCESSORS_EVENTS: &str = r#"WITH
-    [{ids}] AS my_query_id,
-    murmurHash3_32(hostname) as machine_id,
-    (
-        SELECT groupUniqArray((trace_id, attribute['clickhouse.query_id']))
-        FROM clusterAllReplicas('{cluster}', system.opentelemetry_span_log)
-        WHERE (attribute['clickhouse.query_id']) IN my_query_id
-    ) AS my_trace_id,
-    (
-        WITH
-            arraySort(groupUniqArray(operation_name)) AS op_name_array,
-            arrayEnumerate(op_name_array) AS op_name_iid_array
-        SELECT
-            op_name_array,
-            op_name_iid_array
-        FROM clusterAllReplicas('{cluster}', system.opentelemetry_span_log)
-        WHERE trace_id IN my_trace_id.1
-    ) AS op_name_mapping,
-    transform(operation_name, op_name_mapping.1, op_name_mapping.2, 0) AS name_iid,
-    transform(trace_id, my_trace_id.1, my_trace_id.2, '') as query_id,
-    murmurHash3_32(toUInt64OrZero(attribute['clickhouse.thread_id']), query_id) AS track_uuid,
-    [start_time_us, finish_time_us] AS timestamp_arr
-SELECT format('packet {{\n  machine_id: {{}}\n  trusted_packet_sequence_id: {{}}\n  timestamp: {{}}\n  track_event {{\n    categories: "Processors"\n    track_uuid: {{}}\n    name: "{}"\n    type: {{}}\n    thread_time_absolute_us: {{}}\n  }}\n}}', machine_id, track_uuid, timestamp * 1000, track_uuid, operation_name, type, toUInt32OrZero(attribute['execution_time_ms']) * 1000)
-FROM clusterAllReplicas('{cluster}', system.opentelemetry_span_log)
-ARRAY JOIN
-    timestamp_arr AS timestamp,
-    ['TYPE_SLICE_BEGIN', 'TYPE_SLICE_END'] AS type
-WHERE trace_id IN my_trace_id.1
-FORMAT TSVRaw
-SETTINGS allow_experimental_analyzer=1"#;
-
-const QUERY_STREAMING_PROFILE_STACK: &str = r#"WITH
-   [{ids}] AS my_query_id,
-    murmurHash3_32(thread_id, query_id) AS track_uuid,
-    murmurHash3_32(hostname) as machine_id,
-    min(timestamp_ns) AS timestamp_start_us,
-    arraySort(x -> (x.1), groupArray((round(timestamp_ns / 1000), murmurHash3_64(trace)))) AS arr,
-    arr.2 AS callstack_iid,
-    arrayPushFront(arrayPopFront(arrayDifference(arr.1)), round(timestamp_start_us / 1000)) AS timestamp_delta_us,
-    groupUniqArray((murmurHash3_64(trace), trace)) AS calls,
-    arrayStringConcat(arrayMap(call -> format('callstacks {{\n  iid: {}\n  {}\n}}', call.1, arrayStringConcat(arrayMap(fr -> format('frame_ids: {}\n', fr), call.2), '\n')), calls), '\n') AS callstacks,
-    groupUniqArrayArray(trace) AS frame_ids,
-    arrayMap(frame_id -> (frame_id, addressToSymbol(frame_id)), frame_ids) AS frame,
-    arrayMap(function_name_ids -> (splitByChar(':', function_name_ids)[1], toUInt32OrZero(splitByChar(':', function_name_ids)[2]))) AS file,
-    arrayStringConcat(arrayMap(frame_id -> format('frames  {{\n  iid: {}\n  function_name_id: {}\n  mapping_id: {}\n}}', frame_id, frame_id, 1), frame_ids), '\n') AS frames,
-    arrayStringConcat(arrayMap(func_id -> format('function_names  {{\n  iid: {}\n  str: "{}"\n}}', func_id, demangle(addressToSymbol(func_id))), frame_ids), '\n') AS function_names,
-    arrayStringConcat(arrayMap((iid, ts) -> format('    callstack_iid: {}\n    timestamp_delta_us: {}', iid, ts), callstack_iid, timestamp_delta_us), '\n') AS streaming_profile_packet,
-    '    mappings {\n      iid: 1\n      path_string_ids: 1\n      build_id: 1\n    }' AS mappings,
-    '    build_ids {\n      iid: 1\n      str: ""\n    }' AS build_ids,
-    '    mapping_paths {\n      iid: 1\n      str: ""\n    }' AS mapping_paths,
-    'TYPE_INSTANT' AS type
-SELECT format('packet {{\n  machine_id: {{}}\n  trusted_packet_sequence_id: {{}}\n   interned_data: {{\n  {}\n  {}\n  {} \n  {} \n  {} \n {} \n}}\n  streaming_profile_packet: {{\n {} \n}}\n}}', machine_id, track_uuid, mappings, build_ids, mapping_paths, function_names, frames, callstacks, streaming_profile_packet)
-FROM clusterAllReplicas('{cluster}', system.trace_log)
-WHERE (query_id IN my_query_id) AND (trace_type = 'Real')
-GROUP BY
-    thread_id,
-    query_id,
-    trace_type,
-    machine_id
-FORMAT TSVRaw
-SETTINGS allow_introspection_functions = 1, allow_experimental_analyzer = 1"#;
-
-const QUERY_QUERY_LOGS: &str = r#"WITH
-    [{ids}] AS my_query_id,
-    CAST(transform(level, [1, 2, 3, 4, 5, 6, 7, 8, 9], [7, 7, 6, 5, 4, 4, 3, 2, 2], 0), 'Enum8(\'PRIO_UNSPECIFIED\' = 0, \'PRIO_UNUSED\', \'PRIO_VERBOSE\', \'PRIO_DEBUG\', \'PRIO_INFO\', \'PRIO_WARN\', \'PRIO_ERROR\', \'PRIO_FATAL\')') AS prio,
-    murmurHash3_32(thread_id, query_id) AS track_uuid,
-    format('    log_message {{\n      source_location_iid: {}\n   body_iid: {}\n prio: {}\n}}', murmurHash3_32(source_file), murmurHash3_32(message), prio) AS log_message,
-    format('  log_message_body {{ iid: {}  body: "{}" }}', murmurHash3_32(message), message) AS log_message_body,
-    splitByChar(';', source_file)[1] AS file_name,
-    splitByChar(';', source_file)[2] AS func_name,
-    source_line AS line_number,
-    format('  source_locations {{ iid: {} file_name: "{}"  function_name: "{}"  line_number: {} }}', murmurHash3_32(source_file),file_name, func_name, line_number) AS source_locations,
-    format('    interned_data: {{\n {}\n {}\n }}', log_message_body, source_locations) AS interned_data,
-    murmurHash3_32(hostname) AS machine_id,
-    'TYPE_INSTANT' AS type
-SELECT format('packet {{\n  machine_id: {}\n  timestamp: {}\n  track_event {{\n    name: "LogLine"    type: {}\n    track_uuid: {}\n {}\n  }}\n {} trusted_packet_sequence_id: {}\n}}', machine_id, toUnixTimestamp64Nano(event_time_microseconds), type, track_uuid, log_message, interned_data, track_uuid)
-FROM clusterAllReplicas('{cluster}', system.text_log)
-WHERE query_id IN my_query_id
-FORMAT TSVRaw"#;
 
 // TODO:
 // - implement parsing using serde
@@ -313,6 +145,14 @@ fn get_client_name() -> String {
 }
 
 impl ClickHouse {
+    pub fn format_query_ids(query_ids: &[String]) -> String {
+        format!("[{}]", query_ids
+            .iter()
+            .map(|id| format!("'{}'", id))
+            .collect::<Vec<_>>()
+            .join(","))
+    }
+
     pub async fn new(options: ClickHouseOptions) -> Result<Self> {
         let url = format!(
             "{}&client_name={}",
@@ -1091,7 +931,7 @@ impl ClickHouse {
             .await?);
     }
 
-    async fn execute_simple(&self, query: &str) -> Result<()> {
+    pub async fn execute_simple(&self, query: &str) -> Result<()> {
         let mut client = self.pool.get_handle().await?;
         let mut stream = client.query(query).stream_blocks();
         let ret = stream.next().await;
@@ -1131,70 +971,4 @@ impl ClickHouse {
         };
     }
 
-    pub async fn generate_perfetto_trace_pb(
-        &self,
-        initial_query_id: &str,
-        proto: &str,
-        output: &str,
-    ) -> Result<()> {
-        use std::fs;
-        use std::process::Command;
-
-        let query_log = self.get_table_name("system", "query_log");
-        let block = self
-            .execute(&format!(
-                "SELECT DISTINCT query_id FROM {} WHERE initial_query_id = '{}'",
-                query_log, initial_query_id
-            ))
-            .await?;
-        let mut query_ids = Vec::new();
-        for i in 0..block.row_count() {
-            query_ids.push(block.get::<String, _>(i, "query_id")?);
-        }
-        if query_ids.is_empty() {
-            return Err(Error::msg("no queries found"));
-        }
-
-        let ids = query_ids
-            .iter()
-            .map(|id| format!("'{}'", id))
-            .collect::<Vec<_>>()
-            .join(",");
-        let cluster = self.options.cluster.clone().unwrap_or_default();
-
-        let queries = [
-            QUERY_TRACK_QUERY,
-            QUERY_TRACK_THREAD,
-            QUERY_TRACK_COUNTER,
-            QUERY_TRACK_COUNTER_EVENT,
-            QUERY_PROCESSORS_EVENTS,
-            QUERY_STREAMING_PROFILE_STACK,
-            QUERY_QUERY_LOGS,
-        ];
-
-        let mut pbtxt = String::new();
-        for q in queries.iter() {
-            let query = q.replace("{ids}", &ids).replace("{cluster}", &cluster);
-            let block = self.execute(&query).await?;
-            for i in 0..block.row_count() {
-                pbtxt.push_str(&block.get::<String, _>(i, 0)?);
-                pbtxt.push('\n');
-            }
-        }
-
-        let pbtxt_file = NamedTempFile::new()?;
-        fs::write(pbtxt_file.path(), pbtxt)?;
-
-        let mut cmd = Command::new("protoc")
-            .arg("--encode=perfetto.protos.Trace")
-            .arg(proto)
-            .stdin(fs::File::open(pbtxt_file.path())?)
-            .stdout(fs::File::create(output)?)
-            .spawn()?;
-        let status = cmd.wait()?;
-        if !status.success() {
-            return Err(Error::msg("protoc failed"));
-        }
-        Ok(())
-    }
 }
