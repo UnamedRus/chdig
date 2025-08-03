@@ -388,20 +388,26 @@ pub fn open_perfetto_trace_in_browser(trace_data: Vec<u8>) -> Result<()> {
             
             let routes = html_route.or(trace_route);
                 
-            // Use a fixed port for simplicity
-            let port = 8080;
-            let addr = ([127, 0, 0, 1], port);
+            // Use dynamic port allocation
+            let addr = ([127, 0, 0, 1], 0);
+            let (addr, server) = warp::serve(routes).bind_ephemeral(addr);
+            let actual_port = addr.port();
             
-            // Open browser with the local server URL
-            let url = format!("http://127.0.0.1:{}", port);
-            let _ = Command::new("xdg-open")
-                .arg(&url)
-                .stderr(Stdio::null())
-                .stdout(Stdio::null())
-                .status();
+            // Print the URL for manual access
+            let url = format!("http://127.0.0.1:{}", actual_port);
+            println!("Perfetto server started at: {}", url);
             
-            // Run server for 5 minutes then shutdown
-            let server = warp::serve(routes).bind(addr);
+            // Give the server a moment to fully start
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            
+            match open_url_command(&url).status() {
+                Ok(status) if status.success() => {
+                    // Browser opened successfully
+                }
+                _ => {
+                    println!("Could not automatically open browser. Please open the URL manually.");
+                }
+            }
             tokio::select! {
                 _ = server => {},
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(300)) => {

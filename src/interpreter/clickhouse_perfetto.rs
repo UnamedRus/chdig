@@ -1,4 +1,4 @@
-use crate::generated::perfetto_protos::Mapping;
+use crate::generated::perfetto_protos::{Mapping, StreamingAllocation};
 use crate::generated::perfetto_protos::{Trace, TracePacket, trace_packet::OptionalTrustedPacketSequenceId};
 use crate::interpreter::clickhouse::{ClickHouse, Columns};
 use anyhow::Result;
@@ -329,7 +329,7 @@ impl ClickHouse {
         
         // Create frames from callstack data
         let callstack_data = block.get::<Vec<u64>, _>(row, "callstack")?;
-        let frames: Vec<Frame> = callstack_data.iter().enumerate().map(|(i, &frame_id)| {
+        let frames: Vec<Frame> = callstack_data.iter().enumerate().map(|(_i, &frame_id)| {
             Frame {
                 iid: Some(frame_id),
                 function_name_id: Some(frame_id), // Use frame_id as function_name_id
@@ -378,7 +378,7 @@ impl ClickHouse {
             str: Some("".into()),
         }];
         
-        let mut track_packet = self.create_trace_packet_base(
+        let track_packet = self.create_trace_packet_base(
             machine_id,
             Some(0),
             track_uuid as u32,
@@ -454,6 +454,55 @@ impl ClickHouse {
         ))
     }
     
+    fn create_streaming_alloc_free_packet(&self, block: &Columns, row: usize) -> Result<TracePacket> {
+        use crate::generated::perfetto_protos::{
+            trace_packet, StreamingAllocation, StreamingFree
+        };
+        
+        let machine_id = block.get::<u32, _>(row, "machine_id")?;
+        let track_uuid = block.get::<u32, _>(row, "track_uuid")?;
+        let direction = block.get::<i16, _>(row, "direction")?;
+        let clock_monotonic_coarse_timestamp  = block.get::<Vec<u64>, _>(row, "clock_monotonic_coarse_timestamp")?;
+        let address  = block.get::<Vec<u64>, _>(row, "address")?;
+        let size = block.get::<Vec<u64>, _>(row, "size_arr")?;
+        let sequence_number  = block.get::<Vec<u64>, _>(row, "sequence_number")?;
+
+        let track_packet;
+        if direction > 0 {
+            let streaming_packet = StreamingAllocation {
+            address: address,
+            size: size,
+            sample_size: vec![0],
+            clock_monotonic_coarse_timestamp: clock_monotonic_coarse_timestamp  ,
+            heap_id: vec![0],
+            sequence_number: sequence_number,
+        };
+            track_packet = self.create_trace_packet_base(
+            machine_id,
+            Some(0),
+            track_uuid as u32,
+            trace_packet::Data::StreamingAllocation(streaming_packet),
+            None
+        );
+        
+        } else {
+            let streaming_packet = StreamingFree {
+            address: address,
+            heap_id: vec![0],
+            sequence_number: sequence_number,
+        };
+            track_packet = self.create_trace_packet_base(
+            machine_id,
+            Some(0),
+            track_uuid as u32,
+            trace_packet::Data::StreamingFree(streaming_packet),
+            None
+        );
+        };
+
+        Ok(track_packet)
+    }
+
     fn create_track_thread_packet(&self, block: &Columns, row: usize) -> Result<Vec<TracePacket>> {
         use crate::generated::perfetto_protos::{trace_packet, ThreadDescriptor, TrackDescriptor};
         
@@ -586,7 +635,7 @@ SET query_profiler_real_time_period_ns = 10000000,
     }
 
     /// Get Perfetto track query data as protobuf packets
-    pub async fn get_perfetto_track_query(&self, query_ids: &[String]) -> Result<Vec<TracePacket>> {
+    pub async fn get_perfetto_track_query(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
         let ids = Self::format_query_ids(query_ids);
         let table_name = self.get_table_name_no_history("system", "query_log");
         
@@ -604,8 +653,8 @@ SELECT
     query_id,
     hostname
 FROM {}
-WHERE (query_id IN {})
-GROUP BY machine_id, query_id, is_initial_query, uuid, pid, hostname"#, table_name, ids);
+WHERE (query_id IN {}) AND event_date = today() AND event_time BETWEEN {} AND {}
+GROUP BY machine_id, query_id, is_initial_query, uuid, pid, hostname"#, table_name, ids, start, end);
         
         let block = self.execute(&query).await?;
         let mut results = Vec::new();
@@ -618,7 +667,7 @@ GROUP BY machine_id, query_id, is_initial_query, uuid, pid, hostname"#, table_na
     }
 
     /// Get Perfetto track thread data as protobuf packets
-    pub async fn get_perfetto_track_thread(&self, query_ids: &[String]) -> Result<Vec<TracePacket>> {
+    pub async fn get_perfetto_track_thread(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
         let ids = Self::format_query_ids(query_ids);
         let table_name = self.get_table_name_no_history("system", "query_log");
         
@@ -638,8 +687,8 @@ SELECT
     tid,
     query_id
 FROM {}
-WHERE (query_id IN {})
-GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#,table_name,  ids);
+WHERE (query_id IN {}) AND event_date = today() AND event_time BETWEEN {} AND {}
+GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#, table_name,  ids, start, end);
         
         let block = self.execute(&query).await?;
         let mut results = Vec::new();
@@ -652,8 +701,8 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#,table_name,  ids);
     }
 
     /// Get Perfetto processor events data as protobuf packets
-    pub async fn get_perfetto_processors_events_packets(&self, query_ids: &[String]) -> Result<Vec<TracePacket>> {
-        let block = self.get_perfetto_processors_events(query_ids).await?;
+    pub async fn get_perfetto_processors_events_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
+        let block = self.get_perfetto_processors_events(query_ids, start, end).await?;
         let mut results = Vec::new();
         
         for i in 0..block.row_count() {
@@ -664,8 +713,8 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#,table_name,  ids);
     }
 
     /// Get Perfetto track counter event data as protobuf packets
-    pub async fn get_perfetto_track_counter_event_packets(&self, query_ids: &[String]) -> Result<Vec<TracePacket>> {
-        let block = self.get_perfetto_track_counter_event(query_ids).await?;
+    pub async fn get_perfetto_track_counter_event_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
+        let block = self.get_perfetto_track_counter_event(query_ids, start, end).await?;
         let mut results = Vec::new();
         
         for i in 0..block.row_count() {
@@ -676,8 +725,8 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#,table_name,  ids);
     }
 
     /// Get Perfetto track counter data as protobuf packets  
-    pub async fn get_perfetto_track_counter_packets(&self, query_ids: &[String]) -> Result<Vec<TracePacket>> {
-        let block = self.get_perfetto_track_counter(query_ids).await?;
+    pub async fn get_perfetto_track_counter_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
+        let block = self.get_perfetto_track_counter(query_ids, start, end).await?;
         let mut results = Vec::new();
         
         for i in 0..block.row_count() {
@@ -688,8 +737,8 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#,table_name,  ids);
     }
 
     /// Get Perfetto streaming profile stack data as protobuf packets
-    pub async fn get_perfetto_streaming_profile_stack_packets(&self, query_ids: &[String]) -> Result<Vec<TracePacket>> {
-        let block = self.get_perfetto_streaming_profile_stack(query_ids).await?;
+    pub async fn get_perfetto_streaming_profile_stack_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
+        let block = self.get_perfetto_streaming_profile_stack(query_ids, start, end).await?;
         let mut results = Vec::new();
         
         for i in 0..block.row_count() {
@@ -699,9 +748,21 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#,table_name,  ids);
         Ok(results)
     }
 
+    /// Get Perfetto streaming profile stack data as protobuf packets
+    pub async fn get_perfetto_streaming_alloc_free_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
+        let block = self.get_perfetto_streaming_alloc_free(query_ids, start, end).await?;
+        let mut results = Vec::new();
+        
+        for i in 0..block.row_count() {
+            results.push(self.create_streaming_alloc_free_packet(&block, i)?);
+        }
+        
+        Ok(results)
+    }
+
     /// Get Perfetto query logs data as protobuf packets
-    pub async fn get_perfetto_query_logs_packets(&self, query_ids: &[String]) -> Result<Vec<TracePacket>> {
-        let block = self.get_perfetto_query_logs(query_ids).await?;
+    pub async fn get_perfetto_query_logs_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
+        let block = self.get_perfetto_query_logs(query_ids, start, end).await?;
         let mut results = Vec::new();
         
         for i in 0..block.row_count() {
@@ -712,7 +773,7 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#,table_name,  ids);
     }
 
     /// Get Perfetto track counter data
-    pub async fn get_perfetto_track_counter(&self, query_ids: &[String]) -> Result<Columns> {
+    pub async fn get_perfetto_track_counter(&self, query_ids: &[String], start: u64, end: u64) -> Result<Columns> {
         let ids = Self::format_query_ids(query_ids);
         let table_name = self.get_table_name_no_history("system", "trace_log");
         
@@ -738,7 +799,7 @@ SELECT
     query_id,
     event
 FROM {}
-WHERE (query_id IN {}) AND (trace_type = 'ProfileEvent')
+WHERE (query_id IN {}) AND (trace_type = 'ProfileEvent') AND event_date = today() AND event_time BETWEEN {} AND {}
 GROUP BY
     thread_id,
     query_id,
@@ -750,13 +811,13 @@ GROUP BY
     categories,
     unit,
     unit_multiplier,
-    is_incremental"#, table_name, ids);
+    is_incremental"#, table_name, ids, start, end);
         
         self.execute(&query).await
     }
 
     /// Get Perfetto track counter event data
-    pub async fn get_perfetto_track_counter_event(&self, query_ids: &[String]) -> Result<Columns> {
+    pub async fn get_perfetto_track_counter_event(&self, query_ids: &[String], start: u64, end: u64) -> Result<Columns> {
         let ids = Self::format_query_ids(query_ids);
         let table_name = self.get_table_name_no_history("system", "trace_log");
         
@@ -777,23 +838,25 @@ SELECT
     query_id,
     event
 FROM {}
-WHERE (query_id IN {}) AND (trace_type = 'ProfileEvent') AND (increment != 0)
-ORDER BY timestamp_ns ASC"#, table_name, ids);
+WHERE (query_id IN {}) AND (trace_type = 'ProfileEvent') AND (increment != 0) AND event_date = today() AND event_time BETWEEN {} AND {}
+ORDER BY timestamp_ns ASC"#, table_name, ids, start, end);
         
         self.execute(&query).await
     }
 
     /// Get Perfetto processors events data
-    pub async fn get_perfetto_processors_events(&self, query_ids: &[String]) -> Result<Columns> {
+    pub async fn get_perfetto_processors_events(&self, query_ids: &[String], start: u64, end: u64) -> Result<Columns> {
         let ids = Self::format_query_ids(query_ids);
         let table_name = self.get_table_name_no_history("system", "opentelemetry_span_log");
         
         let query = format!(r#"WITH
     murmurHash3_32(hostname) as machine_id,
+    {} * 1_000_000 AS start,
+    {} * 1_000_000 AS end,
     (
         SELECT groupUniqArray((trace_id, attribute['clickhouse.query_id']))
         FROM {}
-        WHERE (attribute['clickhouse.query_id']) IN {}
+        WHERE (attribute['clickhouse.query_id']) IN {} AND start_time_us BETWEEN start AND end
     ) AS my_trace_id,
     (
         WITH
@@ -803,7 +866,7 @@ ORDER BY timestamp_ns ASC"#, table_name, ids);
             op_name_array,
             op_name_iid_array
         FROM {}
-        WHERE trace_id IN my_trace_id.1
+        WHERE trace_id IN my_trace_id.1 AND start_time_us BETWEEN start AND end
     ) AS op_name_mapping,
     transform(operation_name, op_name_mapping.1, op_name_mapping.2, 0) AS name_iid,
     transform(trace_id, my_trace_id.1, my_trace_id.2, '') as query_id,
@@ -822,14 +885,40 @@ FROM {}
 ARRAY JOIN
     timestamp_arr AS timestamp,
     ['TYPE_SLICE_BEGIN', 'TYPE_SLICE_END'] AS type
-WHERE trace_id IN my_trace_id.1
-SETTINGS allow_experimental_analyzer=1"#, table_name, ids, table_name, table_name);
+WHERE trace_id IN my_trace_id.1 AND start_time_us BETWEEN start AND end
+SETTINGS allow_experimental_analyzer=1"#,start, end, table_name, ids, table_name, table_name);
+        
+        self.execute(&query).await
+    }
+
+    /// Get Perfetto streaming profile heap data
+    pub async fn get_perfetto_streaming_alloc_free(&self, query_ids: &[String], start: u64, end: u64) -> Result<Columns> {
+        let ids = Self::format_query_ids(query_ids);
+        let table_name = self.get_table_name_no_history("system", "trace_log");
+        
+        let query = format!(r#"WITH
+    murmurHash3_32(thread_id, query_id) AS track_uuid,
+    murmurHash3_32(hostname) as machine_id,
+    groupArray((timestamp_ns, ptr, abs(size)::UInt64)) as changes,
+    arraySort(x-> x.1 ,changes) AS sorted
+SELECT
+    if(size >= 0, 1, -1) as direction, 
+    machine_id,
+    track_uuid,
+    sorted.1 as address,
+    sorted.2 as clock_monotonic_coarse_timestamp,
+    sorted.3 AS size_arr,
+    arrayEnumerate(address)::Array(UInt64) AS sequence_number
+FROM {}
+WHERE (query_id IN {}) AND (trace_type = 'MemorySample') AND event_date = today() AND event_time BETWEEN {} AND {}
+GROUP BY machine_id, track_uuid, direction
+SETTINGS allow_experimental_analyzer = 1"#, table_name,  ids, start, end);
         
         self.execute(&query).await
     }
 
     /// Get Perfetto streaming profile stack data
-    pub async fn get_perfetto_streaming_profile_stack(&self, query_ids: &[String]) -> Result<Columns> {
+    pub async fn get_perfetto_streaming_profile_stack(&self, query_ids: &[String], start: u64, end: u64) -> Result<Columns> {
         let ids = Self::format_query_ids(query_ids);
         let table_name = self.get_table_name_no_history("system", "trace_log");
         
@@ -837,7 +926,7 @@ SETTINGS allow_experimental_analyzer=1"#, table_name, ids, table_name, table_nam
     murmurHash3_32(thread_id, query_id) AS track_uuid,
     murmurHash3_32(hostname) as machine_id,
     min(round(timestamp_ns / 1000)::Int64) AS timestamp_start_us,
-    arrayDifference(groupArray(round(timestamp_ns / 1000)))::Array(Int64) AS timestamp_delta_us,
+    arrayDifference(arraySort(groupArray(round(timestamp_ns / 1000))))::Array(Int64) AS timestamp_delta_us,
     murmurHash3_64(reverse(trace)) as callstack_iid,
     any(reverse(trace)) AS callstack,
     arrayMap(frame_id -> addressToSymbol(frame_id), callstack) AS frame,
@@ -855,7 +944,7 @@ SELECT
     trace_type,
     type
 FROM {}
-WHERE (query_id IN {}) AND (trace_type = 'Real')
+WHERE (query_id IN {}) AND (trace_type = 'Real') AND event_date = today() AND event_time BETWEEN {} AND {}
 GROUP BY
     thread_id,
     query_id,
@@ -863,13 +952,13 @@ GROUP BY
     machine_id,
     track_uuid,
     callstack_iid
-SETTINGS allow_introspection_functions = 1, allow_experimental_analyzer = 1"#, table_name,  ids);
+SETTINGS allow_introspection_functions = 1, allow_experimental_analyzer = 1"#, table_name,  ids, start, end);
         
         self.execute(&query).await
     }
 
     /// Get Perfetto query logs data
-    pub async fn get_perfetto_query_logs(&self, query_ids: &[String]) -> Result<Columns> {
+    pub async fn get_perfetto_query_logs(&self, query_ids: &[String], start: u64, end: u64) -> Result<Columns> {
         let ids = Self::format_query_ids(query_ids);
         let table_name = self.get_table_name_no_history("system", "text_log");
         
@@ -896,7 +985,7 @@ SELECT
     source_file,
     event_time_microseconds
 FROM {}
-WHERE query_id IN {}"#, table_name, ids);
+WHERE query_id IN {} AND event_date = today() AND event_time BETWEEN {} AND {}"#, table_name, ids, start, end);
         
         self.execute(&query).await
     }
@@ -1108,41 +1197,40 @@ ORDER BY machine_id, event_time ASC"#, table_name, start, end);
         
         let (query_ids, start_time, end_time) = self.execute_with_profiling_and_get_query_ids(database, query).await?;
         
-        // Collect all trace packets
+        // Collect all trace packets in parallel
+        let (
+            track_query_packets,
+            track_thread_packets,
+            counter_packets,
+            counter_event_packets,
+            processor_event_packets,
+            streaming_profile_packets,
+            query_logs_packets,
+            sys_stats_packets,
+            //streaming_alloc_free_packets,
+        ) = tokio::try_join!(
+            self.get_perfetto_track_query(&query_ids, start_time, end_time),
+            self.get_perfetto_track_thread(&query_ids, start_time, end_time),
+            self.get_perfetto_track_counter_packets(&query_ids, start_time, end_time),
+            self.get_perfetto_track_counter_event_packets(&query_ids, start_time, end_time),
+            self.get_perfetto_processors_events_packets(&query_ids, start_time, end_time),
+            self.get_perfetto_streaming_profile_stack_packets(&query_ids, start_time, end_time),
+            self.get_perfetto_query_logs_packets(&query_ids, start_time, end_time),
+            self.get_perfetto_sys_stats_packets(start_time, end_time),
+            //self.get_perfetto_streaming_alloc_free_packets(&query_ids, start_time, end_time),
+        )?;
+        
         let mut all_packets = Vec::new();
-        
-        // Add track query packets
-        let track_query_packets = self.get_perfetto_track_query(&query_ids).await?;
         all_packets.extend(track_query_packets);
-        
-        // Add track thread packets  
-        let track_thread_packets = self.get_perfetto_track_thread(&query_ids).await?;
         all_packets.extend(track_thread_packets);
-        
-        // Add counter track data (profile events metadata)
-        let counter_packets = self.get_perfetto_track_counter_packets(&query_ids).await?;
         all_packets.extend(counter_packets);
-        
-        // Add counter event data (actual profile event values)
-        let counter_event_packets = self.get_perfetto_track_counter_event_packets(&query_ids).await?;
         all_packets.extend(counter_event_packets);
-        
-        // Add processor events data (OpenTelemetry spans)
-        let processor_event_packets = self.get_perfetto_processors_events_packets(&query_ids).await?;
         all_packets.extend(processor_event_packets);
-        
-        // Add streaming profile stack data (call stacks)
-        let streaming_profile_packets = self.get_perfetto_streaming_profile_stack_packets(&query_ids).await?;
         all_packets.extend(streaming_profile_packets);
-        
-        // Add query logs data (text logs)
-        let query_logs_packets = self.get_perfetto_query_logs_packets(&query_ids).await?;
         all_packets.extend(query_logs_packets);
-        
-        // Add system stats data (SysStats packets)
-        let sys_stats_packets = self.get_perfetto_sys_stats_packets(start_time, end_time).await?;
         all_packets.extend(sys_stats_packets);
-        
+        //all_packets.extend(streaming_alloc_free_packets);
+
         // Create the main Trace object
         let trace = Trace {
             packet: all_packets,
