@@ -850,7 +850,7 @@ impl ClickHouse {
                    addr -> demangle(addressToSymbol(addr)),
                    arrayReverse(trace)
                  ), ';'),
-                 arrayStringConcat(symbols, ';')
+                 arrayStringConcat(arrayReverse(symbols), ';')
               ) AS human_trace,
               {} weight
             FROM {}
