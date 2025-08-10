@@ -695,79 +695,6 @@ impl ClickHouse {
             None
         ))
     }
-
-    fn create_processor_event_packet(&self, block: &Columns, row: usize, add_name: bool) -> Result<TracePacket> {
-        use crate::generated::perfetto_protos::{trace_packet, track_event};
-        
-        let machine_id = block.get::<u32, _>(row, "machine_id")?;
-        let uuid: u64 = block.get::<u64, _>(row, "uuid")?;
-        let name_iid = block.get::<u32, _>(row, "name_iid")?;
-        let timestamp_ns = block.get::<u64, _>(row, "timestamp_ns")?;
-        let track_uuid: u64 = block.get::<u32, _>(row, "track_uuid")? as u64;
-        let parent_uuid: u64 = block.get::<u32, _>(row, "parent_uuid")? as u64;
-        let operation_name = block.get::<String, _>(row, "operation_name")?;
-        let event_type = block.get::<String, _>(row, "type")?;
-        let thread_time_absolute_us = block.get::<u64, _>(row, "thread_time_absolute_us")?;
-        
-        // Map string type to TrackEvent type enum
-        let track_event_type = match event_type.as_str() {
-            "TYPE_SLICE_BEGIN" => 1, // TYPE_SLICE_BEGIN
-            "TYPE_SLICE_END" => 2,   // TYPE_SLICE_END  
-            _ => 0, // TYPE_UNSPECIFIED
-        };
-        
-        let thread_time: Option<track_event::ThreadTime> = if event_type == "TYPE_SLICE_BEGIN" {
-            Some(track_event::ThreadTime::ThreadTimeAbsoluteUs(thread_time_absolute_us as i64))
-        } else {
-            None
-        };
-        
-        /*
-        let name = if add_name {
-            Some(track_event::NameField::Name(operation_name.clone()))
-        } else {
-            Some(track_event::NameField::NameIid(name_iid as u64))
-        };
-        */
-
-        let track_event = self.create_track_event_base(
-            Some(track_uuid),
-            Some(track_event_type),
-            Some(track_event::NameField::NameIid(name_iid as u64)),
-            None,
-            thread_time,
-            None
-        );
-
-
-        let interned_data = if add_name {
-            let interned_name = EventName {
-                iid: Some(name_iid as u64),
-                name: Some(operation_name.to_string()),
-            };
-
-            Some(Self::create_interned_data_base(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![interned_name],
-            ))
-        } else {
-            None
-        };
-
-        Ok(self.create_trace_packet_base(
-            machine_id,
-            Some(timestamp_ns),
-            1 as u32,
-            trace_packet::Data::TrackEvent(track_event),
-            interned_data
-        ))
-    }
-
     
     fn create_streaming_alloc_free_packet(&self, block: &Columns, row: usize) -> Result<TracePacket> {
         use crate::generated::perfetto_protos::{
@@ -1013,36 +940,6 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#, table_name,  ids, 
         
         for i in 0..block.row_count() {
             results.append(&mut self.create_track_thread_packet(&block, i)?);
-        }
-        
-        Ok(results)
-    }
-
-    /// Get Perfetto processor events data as protobuf packets
-    pub async fn get_perfetto_processors_events_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
-        let block: clickhouse_rs::Block<clickhouse_rs::types::Complex> = self.get_perfetto_processors_events(query_ids, start, end).await?;
-        let mut results = Vec::new();
-        let mut seen_tracks: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for i in 0..block.row_count() {
-            let operation_name = block.get::<String, _>(i, "operation_name")?;
-            let track_uuid: u64 = block.get::<u32, _>(i, "track_uuid")? as u64;
-            let machine_id = block.get::<u32, _>(i, "machine_id")?;
-            let parent_uuid = block.get::<u32, _>(i, "parent_uuid")? as u64;
-            let timestamp_ns = block.get::<u64, _>(i, "timestamp_ns")?;
-
-            // Create track if not seen yet, also each own track have it's own internedData, so we need to add names separately for each track_uuid
-            if !seen_tracks.contains(&track_uuid) {
-                seen_tracks.insert(track_uuid);
-                results.push(self.create_child_track_packet(machine_id, track_uuid, parent_uuid, Some(timestamp_ns))?);
-            }
-            let add_name = !seen_names.contains(&operation_name);
-            if add_name {
-                seen_names.insert(operation_name);
-            }
-
-            results.push(self.create_processor_event_packet(&block, i, add_name)?);
         }
         
         Ok(results)
