@@ -130,7 +130,7 @@ pub fn open_url_command(url: &str) -> Command {
         c
     };
 
-    cmd.stderr(Stdio::null()).stdout(Stdio::null());
+    cmd.stdout(Stdio::null());
     cmd
 }
 
@@ -396,9 +396,10 @@ pub fn open_perfetto_trace_in_browser(trace_data: Vec<u8>) -> Result<()> {
             // Print the URL for manual access
             let url = format!("http://127.0.0.1:{}", actual_port);
             println!("Perfetto server started at: {}", url);
-            
+            let server_task = tokio::spawn(server);
+
             // Give the server a moment to fully start
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             
             match open_url_command(&url).status() {
                 Ok(status) if status.success() => {
@@ -408,8 +409,11 @@ pub fn open_perfetto_trace_in_browser(trace_data: Vec<u8>) -> Result<()> {
                     println!("Could not automatically open browser. Please open the URL manually.");
                 }
             }
+            
             tokio::select! {
-                _ = server => {},
+                _ = server_task => {
+                    log::info!("Perfetto HTTP server completed");
+                },
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(300)) => {
                     log::info!("Perfetto HTTP server shutting down after 5 minutes");
                 }

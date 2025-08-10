@@ -1,7 +1,409 @@
-use crate::generated::perfetto_protos::{Mapping, StreamingAllocation};
+use crate::generated::perfetto_protos::{EventName, Mapping};
 use crate::generated::perfetto_protos::{Trace, TracePacket, trace_packet::OptionalTrustedPacketSequenceId};
 use crate::interpreter::clickhouse::{ClickHouse, Columns};
 use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
+
+#[derive(Debug, Clone, Copy)]
+pub enum InternedDataType {
+    EventName = 0,
+    FunctionName = 1,
+    SourceLocation = 2,
+    LogMessageBody = 3,
+    BuildId = 4,
+    MappingPath = 5,
+    SourcePath = 6,
+    Frame = 7,
+    Callstack = 8,
+    Mapping = 9,
+}
+
+const CLOCK_ID_UNIXTIME: u32 = 128;
+
+
+// Perfetto trace builder with global interned data state
+pub struct PerfettoTraceBuilder {
+    // Array of HashMaps for each interned data type
+    maps: [Mutex<HashMap<String, u64>>; 10],
+    // Array of ID counters for each type
+    next_ids: [AtomicU64; 10],
+}
+
+impl PerfettoTraceBuilder {
+    pub fn new() -> Self {
+        Self {
+            maps: [
+                Mutex::new(HashMap::new()), // EventName
+                Mutex::new(HashMap::new()), // FunctionName
+                Mutex::new(HashMap::new()), // SourceLocation
+                Mutex::new(HashMap::new()), // LogMessageBody
+                Mutex::new(HashMap::new()), // BuildId
+                Mutex::new(HashMap::new()), // MappingPath
+                Mutex::new(HashMap::new()), // SourcePath
+                Mutex::new(HashMap::new()), // Frame
+                Mutex::new(HashMap::new()), // Callstack
+                Mutex::new(HashMap::new()), // Mapping
+            ],
+            next_ids: [
+                AtomicU64::new(1), AtomicU64::new(1), AtomicU64::new(1), 
+                AtomicU64::new(1), AtomicU64::new(1), AtomicU64::new(1),
+                AtomicU64::new(1), AtomicU64::new(1), AtomicU64::new(1),
+                AtomicU64::new(1)
+            ],
+        }
+    }
+    
+    // Universal helper function to get or create interned ID with double-checked locking
+    pub async fn get_or_create_id(&self, data_type: InternedDataType, value: &str) -> (u64, bool) {
+        let index = data_type as usize;
+        
+        // First check without locking
+        {
+            let map = self.maps[index].lock().await;
+            if let Some(&id) = map.get(value) {
+                return (id, false); // exists, don't add to local interned data
+            }
+        }
+        
+        // Value not found, take the lock and check again (double-checked locking)
+        let mut map = self.maps[index].lock().await;
+        if let Some(&id) = map.get(value) {
+            (id, false) // Another thread added it while we were waiting
+        } else {
+            let id = self.next_ids[index].fetch_add(1, Ordering::SeqCst);
+            map.insert(value.to_string(), id);
+            (id, true) // new entry, add to local interned data
+        }
+    }
+    
+    pub async fn create_streaming_profile_packet(&self, clickhouse: &ClickHouse, block: &Columns, row: usize) -> Result<TracePacket> {
+        use crate::generated::perfetto_protos::{
+            trace_packet, StreamingProfilePacket, Callstack, Frame
+        };
+        
+        let machine_id = block.get::<u32, _>(row, "machine_id")?;
+        let track_uuid = block.get::<u32, _>(row, "track_uuid")?;
+        let timestamp_start_ns = block.get::<i64, _>(row, "timestamp_start_ns")?;
+        
+        // Extract actual data from ClickHouse
+        let mut timestamp_delta_us = block.get::<Vec<i64>, _>(row, "timestamp_delta_us")?;
+        timestamp_delta_us[0] = (timestamp_start_ns as f64 / 1000.0).round() as i64;
+
+        // Extract callstack from ClickHouse data
+        let callstack_data = block.get::<Vec<u64>, _>(row, "callstack")?;
+        let frame_symbols = block.get::<Vec<String>, _>(row, "frame")?;
+        
+        let mut local_function_names = Vec::new();
+        let mut local_frames = Vec::new();
+        let mut local_callstacks = Vec::new();
+        
+        // First, get the global mapping and build IDs
+        let (mapping_path_id, mapping_path_is_new) = self.get_or_create_id(InternedDataType::MappingPath, "").await;
+        let (build_id, build_id_is_new) = self.get_or_create_id(InternedDataType::BuildId, "").await;
+        let mapping_key = format!("{}:{}", build_id, mapping_path_id);
+        let (mapping_id, mapping_is_new) = self.get_or_create_id(InternedDataType::Mapping, &mapping_key).await;
+        
+        // Create frames from callstack data using global function name IDs
+        let mut global_frame_ids = Vec::new();
+        
+        for (&frame_id, symbol) in callstack_data.iter().zip(frame_symbols.iter()) {
+            let (function_name_id, func_is_new) = self.get_or_create_id(InternedDataType::FunctionName, symbol).await;
+            
+            // If it's a new function name, add it to local interned data
+            if func_is_new {
+                local_function_names.push(crate::generated::perfetto_protos::InternedString {
+                    iid: Some(function_name_id),
+                    str: Some(symbol.as_bytes().to_vec()),
+                });
+            }
+            
+            // Create unique key for frame (symbol + mapping)
+            let frame_key = format!("{}:{}", symbol, mapping_id);
+            let (global_frame_id, frame_is_new) = self.get_or_create_id(InternedDataType::Frame, &frame_key).await;
+            
+            if frame_is_new {
+                local_frames.push(Frame {
+                    iid: Some(global_frame_id),
+                    function_name_id: Some(function_name_id),
+                    mapping_id: Some(mapping_id),
+                    rel_pc: None,
+                });
+            }
+            
+            global_frame_ids.push(global_frame_id);
+        }
+        
+        // Create callstack with global frame IDs
+        let callstack_key = global_frame_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let (callstack_id, callstack_is_new) = self.get_or_create_id(InternedDataType::Callstack, &callstack_key).await;
+        
+        if callstack_is_new {
+            local_callstacks.push(Callstack {
+                iid: Some(callstack_id),
+                frame_ids: global_frame_ids,
+            });
+        }
+        
+        // Create streaming profile packet with global callstack ID
+        let callstack_iid = vec![callstack_id; timestamp_delta_us.len()];
+        let streaming_profile_packet = StreamingProfilePacket {
+            callstack_iid,
+            timestamp_delta_us,
+            process_priority: None,
+        };
+        
+        // Create local collections for new entries
+        let mut local_mapping_paths = Vec::new();
+        let mut local_mappings = Vec::new();
+        let mut local_build_ids = Vec::new();
+        
+        // Add to local collections if they're new
+        if mapping_path_is_new {
+            local_mapping_paths.push(crate::generated::perfetto_protos::InternedString {
+                iid: Some(mapping_path_id),
+                str: Some("".into()),
+            });
+        }
+        
+        if build_id_is_new {
+            local_build_ids.push(crate::generated::perfetto_protos::InternedString {
+                iid: Some(build_id),
+                str: Some("".into()),
+            });
+        }
+        
+        if mapping_is_new {
+            local_mappings.push(crate::generated::perfetto_protos::Mapping {
+                iid: Some(mapping_id),
+                build_id: Some(build_id),
+                path_string_ids: vec![mapping_path_id],
+                exact_offset: None,
+                start_offset: None,
+                start: None,
+                end: None,
+                load_bias: None,
+            });
+        }
+        
+        // Create InternedData with only new entries
+        let mut interned_data = ClickHouse::create_interned_data_base(
+            Vec::new(),
+            Vec::new(),
+            local_callstacks, // Only new callstacks for this packet
+            local_frames,     // Only new frames for this packet
+            local_function_names, // Only new function names for this packet
+            Vec::new(),
+            Vec::new(),
+        );
+        
+        // Add the mapping-related fields manually
+        interned_data.mapping_paths = local_mapping_paths;
+        interned_data.mappings = local_mappings;
+        interned_data.build_ids = local_build_ids;
+        
+        let mut track_packet = clickhouse.create_trace_packet_base(
+            machine_id,
+            Some(timestamp_start_ns as u64),
+            1 as u32,
+            trace_packet::Data::StreamingProfilePacket(streaming_profile_packet),
+            Some(interned_data)
+        );
+
+        Ok(track_packet)
+    }
+    
+    pub async fn create_query_log_packet(&self, clickhouse: &ClickHouse, block: &Columns, row: usize) -> Result<TracePacket> {
+        use crate::generated::perfetto_protos::{
+            trace_packet, LogMessage, SourceLocation, LogMessageBody
+        };
+        
+        let machine_id = block.get::<u32, _>(row, "machine_id")?;
+        let track_uuid = block.get::<u32, _>(row, "track_uuid")? as u64;
+        let timestamp_ns = block.get::<i64, _>(row, "timestamp_ns")? as u64;
+        let message = block.get::<String, _>(row, "message")?;
+        let file_name = block.get::<String, _>(row, "file_name")?;
+        let func_name = block.get::<String, _>(row, "func_name")?;
+        let line_number = block.get::<u64, _>(row, "line_number")? as u32;
+        let prio = block.get::<i32, _>(row, "prio")?;
+        
+        // Create unique keys for source location and log message body
+        let source_location_key = format!("{}:{}:{}", file_name, func_name, line_number);
+        let log_message_key = message.clone();
+        
+        // Use global interned data system
+        let (source_location_iid, source_is_new) = self.get_or_create_id(InternedDataType::SourceLocation, &source_location_key).await;
+        let (body_iid, body_is_new) = self.get_or_create_id(InternedDataType::LogMessageBody, &log_message_key).await;
+        
+        // Create log message
+        let log_message = LogMessage {
+            source_location_iid: Some(source_location_iid),
+            body_iid: Some(body_iid),
+            prio: Some(prio as i32),
+        };
+        
+        // Create track event with log message
+        let track_event = clickhouse.create_track_event_base(
+            Some(track_uuid),
+            Some(3), // TYPE_INSTANT = 3
+            None,
+            None,
+            None,
+            Some(log_message)
+        );
+        
+        // Create local interned data only for new entries
+        let mut local_source_locations = Vec::new();
+        let mut local_log_message_bodies = Vec::new();
+        
+        if source_is_new {
+            local_source_locations.push(SourceLocation {
+                iid: Some(source_location_iid),
+                file_name: Some(file_name),
+                function_name: Some(func_name),
+                line_number: Some(line_number),
+            });
+        }
+        
+        if body_is_new {
+            local_log_message_bodies.push(LogMessageBody {
+                iid: Some(body_iid),
+                body: Some(message),
+            });
+        }
+        
+        let interned_data = ClickHouse::create_interned_data_base(
+            local_source_locations,
+            local_log_message_bodies,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        
+        Ok(clickhouse.create_trace_packet_base(
+            machine_id,
+            Some(timestamp_ns),
+            1 as u32,
+            trace_packet::Data::TrackEvent(track_event),
+            Some(interned_data)
+        ))
+    }
+    
+    pub async fn create_processor_event_packet(&self, clickhouse: &ClickHouse, block: &Columns, row: usize) -> Result<TracePacket> {
+        use crate::generated::perfetto_protos::{trace_packet, track_event};
+        
+        let machine_id = block.get::<u32, _>(row, "machine_id")?;
+        let timestamp_ns = block.get::<u64, _>(row, "timestamp_ns")?;
+        let track_uuid: u64 = block.get::<u32, _>(row, "track_uuid")? as u64;
+        let operation_name = block.get::<String, _>(row, "operation_name")?;
+        let event_type = block.get::<String, _>(row, "type")?;
+        let thread_time_absolute_us = block.get::<u64, _>(row, "thread_time_absolute_us")?;
+        
+        // Use global interned data system for event names
+        let (name_iid, name_is_new) = self.get_or_create_id(InternedDataType::EventName, &operation_name).await;
+        
+        // Map string type to TrackEvent type enum
+        let track_event_type = match event_type.as_str() {
+            "TYPE_SLICE_BEGIN" => 1, // TYPE_SLICE_BEGIN
+            "TYPE_SLICE_END" => 2,   // TYPE_SLICE_END  
+            _ => 0, // TYPE_UNSPECIFIED
+        };
+        
+        let thread_time: Option<track_event::ThreadTime> = if event_type == "TYPE_SLICE_BEGIN" {
+            Some(track_event::ThreadTime::ThreadTimeAbsoluteUs(thread_time_absolute_us as i64))
+        } else {
+            None
+        };
+
+        let track_event = clickhouse.create_track_event_base(
+            Some(track_uuid),
+            Some(track_event_type),
+            Some(track_event::NameField::NameIid(name_iid)),
+            None,
+            thread_time,
+            None
+        );
+
+        // Create local interned data only for new event names
+        let interned_data = if name_is_new {
+            let interned_name = crate::generated::perfetto_protos::EventName {
+                iid: Some(name_iid),
+                name: Some(operation_name.to_string()),
+            };
+
+            Some(ClickHouse::create_interned_data_base(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![interned_name],
+            ))
+        } else {
+            None
+        };
+
+        Ok(clickhouse.create_trace_packet_base(
+            machine_id,
+            Some(timestamp_ns),
+            1 as u32,
+            trace_packet::Data::TrackEvent(track_event),
+            interned_data
+        ))
+    }
+    
+    /// Get Perfetto processor events data as protobuf packets using global interned data
+    pub async fn get_perfetto_processors_events_packets(&self, clickhouse: &ClickHouse, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
+        let block = clickhouse.get_perfetto_processors_events(query_ids, start, end).await?;
+        let mut results = Vec::new();
+        let mut seen_tracks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        for i in 0..block.row_count() {
+            let track_uuid: u64 = block.get::<u32, _>(i, "track_uuid")? as u64;
+            let machine_id = block.get::<u32, _>(i, "machine_id")?;
+            let parent_uuid = block.get::<u32, _>(i, "parent_uuid")? as u64;
+            let timestamp_ns = block.get::<u64, _>(i, "timestamp_ns")?;
+
+            // Create track if not seen yet
+            if !seen_tracks.contains(&track_uuid) {
+                seen_tracks.insert(track_uuid);
+                results.push(clickhouse.create_child_track_packet(machine_id, track_uuid, parent_uuid, Some(timestamp_ns))?);
+            }
+
+            results.push(self.create_processor_event_packet(clickhouse, &block, i).await?);
+        }
+        
+        Ok(results)
+    }
+    
+    /// Get Perfetto streaming profile packets using global interned data
+    pub async fn get_perfetto_streaming_profile_packets(&self, clickhouse: &ClickHouse, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
+        let block = clickhouse.get_perfetto_streaming_profile_stack(query_ids, start, end).await?;
+        let mut results = Vec::new();
+        
+        for i in 0..block.row_count() {
+            results.push(self.create_streaming_profile_packet(clickhouse, &block, i).await?);
+        }
+        
+        Ok(results)
+    }
+    
+    /// Get Perfetto query log packets using global interned data
+    pub async fn get_perfetto_query_logs_packets(&self, clickhouse: &ClickHouse, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
+        let block = clickhouse.get_perfetto_query_logs(query_ids, start, end).await?;
+        let mut results = Vec::new();
+        
+        for i in 0..block.row_count() {
+            results.push(self.create_query_log_packet(clickhouse, &block, i).await?);
+        }
+        
+        Ok(results)
+    }
+}
 
 // Helper functions for creating Perfetto protobuf structures
 impl ClickHouse {
@@ -16,10 +418,10 @@ impl ClickHouse {
     ) -> TracePacket {
         TracePacket {
             timestamp,
-            timestamp_clock_id: None,
+            timestamp_clock_id: Some(CLOCK_ID_UNIXTIME),
             trusted_pid: None,
             interned_data,
-            sequence_flags: Some(1),
+            sequence_flags: Some(2),
             incremental_state_cleared: None,
             trace_packet_defaults: None,
             previous_packet_dropped: None,
@@ -38,18 +440,20 @@ impl ClickHouse {
         callstacks: Vec<crate::generated::perfetto_protos::Callstack>,
         frames: Vec<crate::generated::perfetto_protos::Frame>,
         function_names: Vec<crate::generated::perfetto_protos::InternedString>,
+        event_categories: Vec<crate::generated::perfetto_protos::EventCategory>,
+        event_names: Vec<crate::generated::perfetto_protos::EventName>
     ) -> crate::generated::perfetto_protos::InternedData {
         use crate::generated::perfetto_protos::InternedData;
         
         InternedData {
-            source_locations,
-            log_message_body,
-            callstacks,
-            frames,
-            function_names,
+            source_locations: source_locations,
+            log_message_body: log_message_body,
+            callstacks: callstacks,
+            frames: frames,
+            function_names: function_names,
+            event_categories: event_categories,
+            event_names: event_names,
             // Initialize all other fields to empty
-            event_categories: Vec::new(),
-            event_names: Vec::new(),
             debug_annotation_names: Vec::new(),
             debug_annotation_value_type_names: Vec::new(),
             unsymbolized_source_locations: Vec::new(),
@@ -142,6 +546,8 @@ impl ClickHouse {
         let query_id = block.get::<String, _>(row, "query_id")?;
         let hostname = block.get::<String, _>(row, "hostname")?;
         let is_initial_query = block.get::<u8, _>(row, "is_initial_query")? != 0;
+        let timestamp_ns = block.get::<i64, _>(row, "timestamp_ns")? as u64;
+
         let name = if is_initial_query {
             format!("Init Query: {}, host: {}", query_id, hostname)
         } else {
@@ -173,14 +579,17 @@ impl ClickHouse {
             sibling_order_rank: None,
             static_or_dynamic_name: Some(crate::generated::perfetto_protos::track_descriptor::StaticOrDynamicName::Name(name)),
         };
-        
-        Ok(self.create_trace_packet_base(
+
+        let mut track_packet = self.create_trace_packet_base(
             machine_id,
-            Some(0),
-            machine_id,
+            Some(timestamp_ns),
+            1 as u32,
             trace_packet::Data::TrackDescriptor(track_descriptor),
             None
-        ))
+        );
+        track_packet.sequence_flags = Some(1);
+        
+        Ok(track_packet)
     }
     
     fn create_counter_track_packet(&self, block: &Columns, row: usize) -> Result<TracePacket> {
@@ -192,8 +601,8 @@ impl ClickHouse {
         let name = block.get::<String, _>(row, "name")?;
         let unit = block.get::<String, _>(row, "unit")?;
         let unit_multiplier = block.get::<u16, _>(row, "unit_multiplier")? as i64;
-        let is_incremental = block.get::<bool, _>(row, "is_incremental")?;
-        
+        let timestamp_ns = block.get::<i64, _>(row, "timestamp_ns")? as u64;
+
         // Map string type to CounterDescriptor unit_name enum
         let counter_unit_name = match unit.as_str() {
             "UNIT_TIME_NS" => 1, // UNIT_TIME_NS
@@ -208,7 +617,7 @@ impl ClickHouse {
             unit: Some(counter_unit_name),
             unit_name: None,
             unit_multiplier: Some(unit_multiplier),
-            is_incremental: Some(is_incremental),
+            is_incremental: Some(true),
         };
         
         let track_descriptor = TrackDescriptor {
@@ -227,8 +636,8 @@ impl ClickHouse {
         
         Ok(self.create_trace_packet_base(
             machine_id,
-            Some(0),
-            parent_uuid as u32,
+            Some(timestamp_ns),
+            1 as u32,
             trace_packet::Data::TrackDescriptor(track_descriptor),
             None
         ))
@@ -255,18 +664,47 @@ impl ClickHouse {
         Ok(self.create_trace_packet_base(
             machine_id,
             Some(timestamp_ns),
-            parent_uuid as u32,
+            1 as u32,
             trace_packet::Data::TrackEvent(track_event),
             None
         ))
     }
     
-    fn create_processor_event_packet(&self, block: &Columns, row: usize) -> Result<TracePacket> {
+    fn create_child_track_packet(&self, machine_id: u32, track_uuid: u64, parent_uuid: u64, timestamp: Option<u64>) -> Result<TracePacket> {
+        use crate::generated::perfetto_protos::{trace_packet, TrackDescriptor};
+        
+        let track_descriptor = TrackDescriptor {
+            uuid: Some(track_uuid),
+            parent_uuid: Some(parent_uuid),
+            process: None,
+            chrome_process: None,
+            thread: None,
+            chrome_thread: None,
+            counter: None,
+            disallow_merging_with_system_tracks: None,
+            child_ordering: None,
+            sibling_order_rank: None,
+            static_or_dynamic_name: Some(crate::generated::perfetto_protos::track_descriptor::StaticOrDynamicName::Name("Processors".to_string())),
+        };
+        
+        Ok(self.create_trace_packet_base(
+            machine_id,
+            timestamp,
+            1 as u32,
+            trace_packet::Data::TrackDescriptor(track_descriptor),
+            None
+        ))
+    }
+
+    fn create_processor_event_packet(&self, block: &Columns, row: usize, add_name: bool) -> Result<TracePacket> {
         use crate::generated::perfetto_protos::{trace_packet, track_event};
         
         let machine_id = block.get::<u32, _>(row, "machine_id")?;
+        let uuid: u64 = block.get::<u64, _>(row, "uuid")?;
+        let name_iid = block.get::<u32, _>(row, "name_iid")?;
         let timestamp_ns = block.get::<u64, _>(row, "timestamp_ns")?;
         let track_uuid: u64 = block.get::<u32, _>(row, "track_uuid")? as u64;
+        let parent_uuid: u64 = block.get::<u32, _>(row, "parent_uuid")? as u64;
         let operation_name = block.get::<String, _>(row, "operation_name")?;
         let event_type = block.get::<String, _>(row, "type")?;
         let thread_time_absolute_us = block.get::<u64, _>(row, "thread_time_absolute_us")?;
@@ -278,181 +716,58 @@ impl ClickHouse {
             _ => 0, // TYPE_UNSPECIFIED
         };
         
+        let thread_time: Option<track_event::ThreadTime> = if event_type == "TYPE_SLICE_BEGIN" {
+            Some(track_event::ThreadTime::ThreadTimeAbsoluteUs(thread_time_absolute_us as i64))
+        } else {
+            None
+        };
+        
+        /*
+        let name = if add_name {
+            Some(track_event::NameField::Name(operation_name.clone()))
+        } else {
+            Some(track_event::NameField::NameIid(name_iid as u64))
+        };
+        */
+
         let track_event = self.create_track_event_base(
             Some(track_uuid),
             Some(track_event_type),
-            Some(track_event::NameField::Name(operation_name)),
+            Some(track_event::NameField::NameIid(name_iid as u64)),
             None,
-            Some(track_event::ThreadTime::ThreadTimeAbsoluteUs(thread_time_absolute_us as i64)),
+            thread_time,
             None
         );
-        
+
+
+        let interned_data = if add_name {
+            let interned_name = EventName {
+                iid: Some(name_iid as u64),
+                name: Some(operation_name.to_string()),
+            };
+
+            Some(Self::create_interned_data_base(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![interned_name],
+            ))
+        } else {
+            None
+        };
+
         Ok(self.create_trace_packet_base(
             machine_id,
             Some(timestamp_ns),
-            track_uuid as u32,
+            1 as u32,
             trace_packet::Data::TrackEvent(track_event),
-            None
+            interned_data
         ))
     }
-    
-    fn create_streaming_profile_packet(&self, block: &Columns, row: usize) -> Result<TracePacket> {
-        use crate::generated::perfetto_protos::{
-            trace_packet, StreamingProfilePacket, Callstack, Frame, InternedString
-        };
-        
-        let machine_id = block.get::<u32, _>(row, "machine_id")?;
-        let track_uuid = block.get::<u32, _>(row, "track_uuid")?;
-        let timestamp_start_us = block.get::<i64, _>(row, "timestamp_start_us")?;
-        
-        // Extract actual data from ClickHouse
-        let mut timestamp_delta_us = block.get::<Vec<i64>, _>(row, "timestamp_delta_us")?;
-        let callstack_iid_value = block.get::<u64, _>(row, "callstack_iid")?;
-        let callstack_iid = vec![callstack_iid_value; timestamp_delta_us.len()];
-        timestamp_delta_us[0] = timestamp_start_us;
-        
-        // Create streaming profile packet
-        let streaming_profile_packet = StreamingProfilePacket {
-            callstack_iid,
-            timestamp_delta_us,
-            process_priority: None,
-        };
-        
-        // Extract callstack from ClickHouse data
-        let callstack_data = block.get::<Vec<u64>, _>(row, "callstack")?;
-        let callstacks = vec![
-            Callstack {
-                iid: Some(block.get::<u64, _>(row, "callstack_iid")?),
-                frame_ids: callstack_data,
-            },
-        ];
-        
-        // Create frames from callstack data
-        let callstack_data = block.get::<Vec<u64>, _>(row, "callstack")?;
-        let frames: Vec<Frame> = callstack_data.iter().enumerate().map(|(_i, &frame_id)| {
-            Frame {
-                iid: Some(frame_id),
-                function_name_id: Some(frame_id), // Use frame_id as function_name_id
-                mapping_id: Some(1),
-                rel_pc: None,
-            }
-        }).collect();
-        
-        // Create function names from frame symbols
-        let frame_symbols = block.get::<Vec<String>, _>(row, "frame")?;
-        let callstack_data = block.get::<Vec<u64>, _>(row, "callstack")?;
-        let function_names: Vec<InternedString> = callstack_data.iter().zip(frame_symbols.iter()).map(|(&frame_id, symbol)| {
-            InternedString {
-                iid: Some(frame_id),
-                str: Some(symbol.as_bytes().to_vec()),
-            }
-        }).collect();
-        
-        // Create InternedData with callstacks and frames
-        let mut interned_data = Self::create_interned_data_base(
-            Vec::new(),
-            Vec::new(),
-            callstacks,
-            frames,
-            function_names
-        );
 
-        interned_data.mapping_paths = vec![InternedString {
-            iid: Some(1),
-            str: Some("".into()),
-        }];
-
-        interned_data.mappings = vec![Mapping {
-            iid: Some(1),
-            build_id: Some(1),
-            path_string_ids: vec![1],
-            exact_offset: None,
-            start_offset: None,
-            start: None,
-            end: None,
-            load_bias: None,
-        }]; 
-
-        interned_data.build_ids = vec![InternedString {
-            iid: Some(1),
-            str: Some("".into()),
-        }];
-        
-        let track_packet = self.create_trace_packet_base(
-            machine_id,
-            Some(0),
-            track_uuid as u32,
-            trace_packet::Data::StreamingProfilePacket(streaming_profile_packet),
-            Some(interned_data)
-        );
-
-        Ok(track_packet)
-    }
-    
-    fn create_query_log_packet(&self, block: &Columns, row: usize) -> Result<TracePacket> {
-        use crate::generated::perfetto_protos::{
-            trace_packet, LogMessage, SourceLocation, LogMessageBody
-        };
-        
-        let machine_id = block.get::<u32, _>(row, "machine_id")?;
-        let timestamp_ns = block.get::<i64, _>(row, "timestamp_ns")? as u64;
-        let track_uuid = block.get::<u32, _>(row, "track_uuid")? as u64;
-        let prio = block.get::<i32, _>(row, "prio")?;
-        let message = block.get::<String, _>(row, "message")?;
-        let file_name = block.get::<String, _>(row, "file_name")?;
-        let func_name = block.get::<String, _>(row, "func_name")?;
-        let line_number = block.get::<u64, _>(row, "line_number")? as u32;
-        
-        // Generate IDs for interned data
-        let source_location_iid = (file_name.len() as u64 + func_name.len() as u64 + line_number as u64) % 100000;
-        let body_iid = message.len() as u64 % 100000;
-        
-        // Create log message
-        let log_message = LogMessage {
-            source_location_iid: Some(source_location_iid),
-            body_iid: Some(body_iid),
-            prio: Some(prio),
-        };
-        
-        // Create track event with log message
-        let track_event = self.create_track_event_base(
-            Some(track_uuid),
-            Some(9), // TYPE_INSTANT = 9
-            None,
-            None,
-            None,
-            Some(log_message)
-        );
-        
-        // Create InternedData with source location and log message body
-        let source_location = SourceLocation {
-            iid: Some(source_location_iid),
-            file_name: Some(file_name),
-            function_name: Some(func_name),
-            line_number: Some(line_number),
-        };
-        
-        let log_message_body = LogMessageBody {
-            iid: Some(body_iid),
-            body: Some(message),
-        };
-        
-        let interned_data = Self::create_interned_data_base(
-            vec![source_location],
-            vec![log_message_body],
-            Vec::new(),
-            Vec::new(),
-            Vec::new()
-        );
-        
-        Ok(self.create_trace_packet_base(
-            machine_id,
-            Some(timestamp_ns),
-            track_uuid as u32,
-            trace_packet::Data::TrackEvent(track_event),
-            Some(interned_data)
-        ))
-    }
     
     fn create_streaming_alloc_free_packet(&self, block: &Columns, row: usize) -> Result<TracePacket> {
         use crate::generated::perfetto_protos::{
@@ -480,7 +795,7 @@ impl ClickHouse {
             track_packet = self.create_trace_packet_base(
             machine_id,
             Some(0),
-            track_uuid as u32,
+            1 as u32,
             trace_packet::Data::StreamingAllocation(streaming_packet),
             None
         );
@@ -494,7 +809,7 @@ impl ClickHouse {
             track_packet = self.create_trace_packet_base(
             machine_id,
             Some(0),
-            track_uuid as u32,
+            1 as u32,
             trace_packet::Data::StreamingFree(streaming_packet),
             None
         );
@@ -512,6 +827,7 @@ impl ClickHouse {
         let parent_uuid = block.get::<u32, _>(row, "parent_uuid")? as u64;
         let pid = block.get::<u32, _>(row, "pid")? as i32;
         let tid = block.get::<u64, _>(row, "tid")? as i32;
+        let timestamp_ns = block.get::<i64, _>(row, "timestamp_ns")? as u64;
         let name = format!("Thread: {}", tid);
         let counter_name = format!("Thread: {}, Counters", tid);        
 
@@ -557,15 +873,15 @@ impl ClickHouse {
         let track_thread_packets = vec![
             self.create_trace_packet_base(
                 machine_id,
-                Some(0),
-                uuid as u32,
+                Some(timestamp_ns),
+                1 as u32,
                 trace_packet::Data::TrackDescriptor(track_descriptor),
                 None
             ),
             self.create_trace_packet_base(
                 machine_id,
-                Some(0),
-                counter_uuid as u32,
+                Some(timestamp_ns),
+                1 as u32,
                 trace_packet::Data::TrackDescriptor(counter_track_descriptor),
                 None
             ),
@@ -651,7 +967,8 @@ SELECT
     pid,
     is_initial_query,
     query_id,
-    hostname
+    hostname,
+    toUnixTimestamp64Nano(min(event_time_microseconds) - INTERVAL 100 MICROSECONDS) as timestamp_ns
 FROM {}
 WHERE (query_id IN {}) AND event_date = today() AND event_time BETWEEN {} AND {}
 GROUP BY machine_id, query_id, is_initial_query, uuid, pid, hostname"#, table_name, ids, start, end);
@@ -685,7 +1002,8 @@ SELECT
     counter_uuid,
     pid,
     tid,
-    query_id
+    query_id,
+    toUnixTimestamp64Nano(min(event_time_microseconds) - INTERVAL 100 MICROSECONDS) as timestamp_ns
 FROM {}
 WHERE (query_id IN {}) AND event_date = today() AND event_time BETWEEN {} AND {}
 GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#, table_name,  ids, start, end);
@@ -702,11 +1020,29 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#, table_name,  ids, 
 
     /// Get Perfetto processor events data as protobuf packets
     pub async fn get_perfetto_processors_events_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
-        let block = self.get_perfetto_processors_events(query_ids, start, end).await?;
+        let block: clickhouse_rs::Block<clickhouse_rs::types::Complex> = self.get_perfetto_processors_events(query_ids, start, end).await?;
         let mut results = Vec::new();
-        
+        let mut seen_tracks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for i in 0..block.row_count() {
-            results.push(self.create_processor_event_packet(&block, i)?);
+            let operation_name = block.get::<String, _>(i, "operation_name")?;
+            let track_uuid: u64 = block.get::<u32, _>(i, "track_uuid")? as u64;
+            let machine_id = block.get::<u32, _>(i, "machine_id")?;
+            let parent_uuid = block.get::<u32, _>(i, "parent_uuid")? as u64;
+            let timestamp_ns = block.get::<u64, _>(i, "timestamp_ns")?;
+
+            // Create track if not seen yet, also each own track have it's own internedData, so we need to add names separately for each track_uuid
+            if !seen_tracks.contains(&track_uuid) {
+                seen_tracks.insert(track_uuid);
+                results.push(self.create_child_track_packet(machine_id, track_uuid, parent_uuid, Some(timestamp_ns))?);
+            }
+            let add_name = !seen_names.contains(&operation_name);
+            if add_name {
+                seen_names.insert(operation_name);
+            }
+
+            results.push(self.create_processor_event_packet(&block, i, add_name)?);
         }
         
         Ok(results)
@@ -736,17 +1072,6 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#, table_name,  ids, 
         Ok(results)
     }
 
-    /// Get Perfetto streaming profile stack data as protobuf packets
-    pub async fn get_perfetto_streaming_profile_stack_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
-        let block = self.get_perfetto_streaming_profile_stack(query_ids, start, end).await?;
-        let mut results = Vec::new();
-        
-        for i in 0..block.row_count() {
-            results.push(self.create_streaming_profile_packet(&block, i)?);
-        }
-        
-        Ok(results)
-    }
 
     /// Get Perfetto streaming profile stack data as protobuf packets
     pub async fn get_perfetto_streaming_alloc_free_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
@@ -755,18 +1080,6 @@ GROUP BY tid, machine_id, query_id, uuid, parent_uuid, pid"#, table_name,  ids, 
         
         for i in 0..block.row_count() {
             results.push(self.create_streaming_alloc_free_packet(&block, i)?);
-        }
-        
-        Ok(results)
-    }
-
-    /// Get Perfetto query logs data as protobuf packets
-    pub async fn get_perfetto_query_logs_packets(&self, query_ids: &[String], start: u64, end: u64) -> Result<Vec<TracePacket>> {
-        let block = self.get_perfetto_query_logs(query_ids, start, end).await?;
-        let mut results = Vec::new();
-        
-        for i in 0..block.row_count() {
-            results.push(self.create_query_log_packet(&block, i)?);
         }
         
         Ok(results)
@@ -797,7 +1110,8 @@ SELECT
     is_incremental,
     thread_id,
     query_id,
-    event
+    event,
+    toUnixTimestamp64Nano(min(event_time_microseconds) - INTERVAL 100 MICROSECONDS) AS timestamp_ns
 FROM {}
 WHERE (query_id IN {}) AND (trace_type = 'ProfileEvent') AND event_date = today() AND event_time BETWEEN {} AND {}
 GROUP BY
@@ -858,23 +1172,19 @@ ORDER BY timestamp_ns ASC"#, table_name, ids, start, end);
         FROM {}
         WHERE (attribute['clickhouse.query_id']) IN {} AND start_time_us BETWEEN start AND end
     ) AS my_trace_id,
-    (
-        WITH
-            arraySort(groupUniqArray(operation_name)) AS op_name_array,
-            arrayEnumerate(op_name_array) AS op_name_iid_array
-        SELECT
-            op_name_array,
-            op_name_iid_array
-        FROM {}
-        WHERE trace_id IN my_trace_id.1 AND start_time_us BETWEEN start AND end
-    ) AS op_name_mapping,
-    transform(operation_name, op_name_mapping.1, op_name_mapping.2, 0) AS name_iid,
     transform(trace_id, my_trace_id.1, my_trace_id.2, '') as query_id,
-    murmurHash3_32(toUInt64OrZero(attribute['clickhouse.thread_id']), query_id) AS track_uuid,
+    span_id as uuid,
+    murmurHash3_32(operation_name) as name_iid,
+    --murmurHash3_32(query_id) AS parent_uuid,
+    murmurHash3_32(toUInt64OrZero(attribute['clickhouse.thread_id']), query_id) AS parent_uuid,
+    murmurHash3_32(toUInt64OrZero(attribute['clickhouse.thread_id']), query_id, operation_name) AS track_uuid,
     [start_time_us, finish_time_us] AS timestamp_arr
 SELECT 
     machine_id,
     track_uuid,
+    parent_uuid,
+    uuid,
+    name_iid,
     timestamp * 1000 AS timestamp_ns,
     operation_name,
     type,
@@ -886,7 +1196,8 @@ ARRAY JOIN
     timestamp_arr AS timestamp,
     ['TYPE_SLICE_BEGIN', 'TYPE_SLICE_END'] AS type
 WHERE trace_id IN my_trace_id.1 AND start_time_us BETWEEN start AND end
-SETTINGS allow_experimental_analyzer=1"#,start, end, table_name, ids, table_name, table_name);
+ORDER BY timestamp ASC
+SETTINGS allow_experimental_analyzer=1"#,start, end, table_name, ids, table_name);
         
         self.execute(&query).await
     }
@@ -925,33 +1236,27 @@ SETTINGS allow_experimental_analyzer = 1"#, table_name,  ids, start, end);
         let query = format!(r#"WITH
     murmurHash3_32(thread_id, query_id) AS track_uuid,
     murmurHash3_32(hostname) as machine_id,
-    min(round(timestamp_ns / 1000)::Int64) AS timestamp_start_us,
-    arrayDifference(arraySort(groupArray(round(timestamp_ns / 1000))))::Array(Int64) AS timestamp_delta_us,
-    murmurHash3_64(reverse(trace)) as callstack_iid,
+    min(timestamp_ns::Int64) AS timestamp_start_ns,
+    arrayMap(x -> round(x/1000), arrayDifference(arraySort(groupArray(timestamp_ns))))::Array(Int64) AS timestamp_delta_us,
     any(reverse(trace)) AS callstack,
-    arrayMap(frame_id -> addressToSymbol(frame_id), callstack) AS frame,
-    'TYPE_INSTANT' AS type
+    arrayMap(frame_id -> addressToSymbol(frame_id), callstack) AS frame
 SELECT 
     machine_id,
     track_uuid,
-    callstack_iid,
-    timestamp_start_us,
+    timestamp_start_ns,
     timestamp_delta_us,
     callstack,
     frame,
     thread_id,
-    query_id,
-    trace_type,
-    type
+    query_id
 FROM {}
 WHERE (query_id IN {}) AND (trace_type = 'Real') AND event_date = today() AND event_time BETWEEN {} AND {}
 GROUP BY
     thread_id,
     query_id,
-    trace_type,
     machine_id,
-    track_uuid,
-    callstack_iid
+    track_uuid
+ORDER BY timestamp_start_ns ASC
 SETTINGS allow_introspection_functions = 1, allow_experimental_analyzer = 1"#, table_name,  ids, start, end);
         
         self.execute(&query).await
@@ -968,8 +1273,7 @@ SETTINGS allow_introspection_functions = 1, allow_experimental_analyzer = 1"#, t
     splitByChar(';', source_file)[1] AS file_name,
     splitByChar(';', source_file)[2] AS func_name,
     source_line AS line_number,
-    murmurHash3_32(hostname) AS machine_id,
-    'TYPE_INSTANT' AS type
+    murmurHash3_32(hostname) AS machine_id
 SELECT 
     machine_id,
     toUnixTimestamp64Nano(event_time_microseconds) AS timestamp_ns,
@@ -1169,7 +1473,7 @@ ORDER BY machine_id, event_time ASC"#, table_name, start, end);
         Ok(self.create_trace_packet_base(
             machine_id,
             Some(timestamp_ns),
-            machine_id,
+            1 as u32,
             trace_packet::Data::SysStats(sys_stats),
             None
         ))
@@ -1187,6 +1491,41 @@ ORDER BY machine_id, event_time ASC"#, table_name, start, end);
         Ok(results)
     }
 
+    pub fn get_perfetto_clock_snapshot(&self) -> Result<TracePacket> {
+        use crate::generated::perfetto_protos::{trace_packet, ClockSnapshot};
+        use crate::generated::perfetto_protos::clock_snapshot::Clock;
+        
+        // Create clock snapshot with realtime clock
+        let clock_snapshot = ClockSnapshot {
+            clocks: vec![
+                Clock {
+                    clock_id: Some(CLOCK_ID_UNIXTIME), // CUSTOM clock ID
+                    timestamp: Some(0),
+                    unit_multiplier_ns: Some(1), // Already in nanoseconds
+                    is_incremental: Some(false),
+                },
+                Clock {
+                    clock_id: Some(6), // BOOTTIME clock ID
+                    timestamp: Some(0),
+                    unit_multiplier_ns: Some(1), // Already in nanoseconds
+                    is_incremental: Some(false),
+                }
+            ],
+            primary_trace_clock: None, // Use BOOTTIME as primary
+        };
+        
+        let mut trace_packet = self.create_trace_packet_base(
+            3547214653, // No specific machine_id for clock snapshot
+            Some(0), // Clock snapshot at time 0
+            1 as u32,
+            trace_packet::Data::ClockSnapshot(clock_snapshot),
+            None
+        );
+
+        trace_packet.timestamp_clock_id = Some(CLOCK_ID_UNIXTIME);
+        Ok(trace_packet)
+    }
+
     pub async fn generate_perfetto_trace_pb(
         &self,
         database: &str,
@@ -1197,7 +1536,10 @@ ORDER BY machine_id, event_time ASC"#, table_name, start, end);
         
         let (query_ids, start_time, end_time) = self.execute_with_profiling_and_get_query_ids(database, query).await?;
         
-        // Collect all trace packets in parallel
+        // Create PerfettoTraceBuilder with global interned data management
+        let trace_builder = PerfettoTraceBuilder::new();
+        
+        // Collect all trace packets in parallel using the single trace_builder instance
         let (
             track_query_packets,
             track_thread_packets,
@@ -1213,14 +1555,16 @@ ORDER BY machine_id, event_time ASC"#, table_name, start, end);
             self.get_perfetto_track_thread(&query_ids, start_time, end_time),
             self.get_perfetto_track_counter_packets(&query_ids, start_time, end_time),
             self.get_perfetto_track_counter_event_packets(&query_ids, start_time, end_time),
-            self.get_perfetto_processors_events_packets(&query_ids, start_time, end_time),
-            self.get_perfetto_streaming_profile_stack_packets(&query_ids, start_time, end_time),
-            self.get_perfetto_query_logs_packets(&query_ids, start_time, end_time),
+            trace_builder.get_perfetto_processors_events_packets(self, &query_ids, start_time, end_time),
+            trace_builder.get_perfetto_streaming_profile_packets(self, &query_ids, start_time, end_time),
+            trace_builder.get_perfetto_query_logs_packets(self, &query_ids, start_time, end_time),
             self.get_perfetto_sys_stats_packets(start_time, end_time),
             //self.get_perfetto_streaming_alloc_free_packets(&query_ids, start_time, end_time),
         )?;
         
         let mut all_packets = Vec::new();
+
+        
         all_packets.extend(track_query_packets);
         all_packets.extend(track_thread_packets);
         all_packets.extend(counter_packets);
@@ -1231,6 +1575,11 @@ ORDER BY machine_id, event_time ASC"#, table_name, start, end);
         all_packets.extend(sys_stats_packets);
         //all_packets.extend(streaming_alloc_free_packets);
 
+        // Sort all packets by timestamp ascending
+        all_packets.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        all_packets.insert(0, self.get_perfetto_clock_snapshot()?);
+
+        // Add clock snapshot at the beginning
         // Create the main Trace object
         let trace = Trace {
             packet: all_packets,
