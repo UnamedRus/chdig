@@ -268,7 +268,7 @@ version = "25.8.1"
 dependencies = [
  "anyhow",
  "backtrace",
- "base64 0.21.7",
+ "base64",
  "chrono",
  "chrono-tz",
  "clap",
