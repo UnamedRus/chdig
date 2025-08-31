@@ -72,7 +72,7 @@ impl PerfettoTraceBuilder {
         if let Some(&id) = map.get(value) {
             (id, false) // Another thread added it while we were waiting
         } else {
-            let id = self.next_ids[index].fetch_add(1, Ordering::SeqCst);
+            let id: u64 = self.next_ids[index].fetch_add(1, Ordering::SeqCst);
             map.insert(value.to_string(), id);
             (id, true) // new entry, add to local interned data
         }

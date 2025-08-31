@@ -486,7 +486,7 @@ async fn process_event(context: ContextArc, event: Event, need_clear: &mut bool)
         }
         Event::OpenPerfettoTrace(database, query, initial_id) => {
             let output = format!("{}.pb", initial_id);
-            let ret = clickhouse
+            let ret: std::result::Result<Vec<u8>, anyhow::Error> = clickhouse
                 .generate_perfetto_trace_pb(&database, &query, &output)
                 .await;
             let message = match ret {
