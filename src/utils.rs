@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use syntect::{highlighting::ThemeSet, parsing::SyntaxSet};
 use tempfile::Builder;
 use urlencoding::encode;
+use tokio::net::TcpListener;
 
 #[cfg(not(target_family = "windows"))]
 use {crate::actions::ActionDescription, skim::prelude::*};
@@ -399,16 +400,18 @@ pub fn open_perfetto_trace_in_browser(trace_data: Vec<u8>) -> Result<()> {
                 });
             
             let routes = html_route.or(trace_route);
-                
+
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap(); // <-- actual assigned port here
+
             // Use dynamic port allocation
-            let addr = ([127, 0, 0, 1], 0);
-            let (addr, server) = warp::serve(routes).bind_ephemeral(addr);
-            let actual_port = addr.port();
+            let server = warp::serve(routes).incoming(listener);
             
             // Print the URL for manual access
-            let url = format!("http://127.0.0.1:{}", actual_port);
+            let url = format!("http://{}", addr);
             println!("Perfetto server started at: {}", url);
-            let server_task = tokio::spawn(server);
+            let server_task = tokio::spawn(server.run());
 
             // Give the server a moment to fully start
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
